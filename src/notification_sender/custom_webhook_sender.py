@@ -7,10 +7,13 @@
 """
 import logging
 import json
+from string import Template
+from typing import Any, Optional
+
 import requests
 
 from src.config import Config
-from src.formatters import chunk_markdown_by_bytes, truncate_to_bytes
+from src.formatters import chunk_content_by_max_bytes, slice_at_max_bytes
 
 
 logger = logging.getLogger(__name__)
@@ -27,6 +30,7 @@ class CustomWebhookSender:
         """
         self._custom_webhook_urls = getattr(config, 'custom_webhook_urls', []) or []
         self._custom_webhook_bearer_token = getattr(config, 'custom_webhook_bearer_token', None)
+        self._custom_webhook_body_template = getattr(config, 'custom_webhook_body_template', None)
         self._webhook_verify_ssl = getattr(config, 'webhook_verify_ssl', True)
  
     def send_to_custom(self, content: str) -> bool:
@@ -64,7 +68,17 @@ class CustomWebhookSender:
                 
                 # 钉钉机器人对 body 有字节上限（约 20000 bytes），超长需要分批发送
                 if self._is_dingtalk_webhook(url):
-                    if self._send_dingtalk_chunked(url, content, max_bytes=20000):
+                    templated_payload = self._build_custom_webhook_template_payload(content)
+                    if templated_payload is not None:
+                        if self._post_custom_webhook(url, templated_payload, timeout=30):
+                            logger.info(f"自定义 Webhook {i+1}（钉钉模板）推送成功")
+                            success_count += 1
+                        elif self._send_dingtalk_chunked(url, content, max_bytes=20000):
+                            logger.info(f"自定义 Webhook {i+1}（钉钉模板失败，回退分批）推送成功")
+                            success_count += 1
+                        else:
+                            logger.error(f"自定义 Webhook {i+1}（钉钉模板）推送失败")
+                    elif self._send_dingtalk_chunked(url, content, max_bytes=20000):
                         logger.info(f"自定义 Webhook {i+1}（钉钉）推送成功")
                         success_count += 1
                     else:
@@ -153,6 +167,10 @@ class CustomWebhookSender:
         
         自动识别常见服务并使用对应格式
         """
+        templated_payload = self._build_custom_webhook_template_payload(content)
+        if templated_payload is not None:
+            return templated_payload
+
         url_lower = url.lower()
         
         # 钉钉机器人
@@ -195,13 +213,42 @@ class CustomWebhookSender:
             "message": content,
             "body": content
         }
+
+    def _build_custom_webhook_template_payload(self, content: str) -> Optional[dict]:
+        """Build payload from CUSTOM_WEBHOOK_BODY_TEMPLATE when configured."""
+        template = (self._custom_webhook_body_template or "").strip()
+        if not template:
+            return None
+
+        title = "股票分析报告"
+        variables = {
+            "title": title,
+            "title_json": json.dumps(title, ensure_ascii=False),
+            "content": content,
+            "content_json": json.dumps(content, ensure_ascii=False),
+        }
+        rendered = Template(template).safe_substitute(variables)
+        try:
+            payload: Any = json.loads(rendered)
+        except json.JSONDecodeError as exc:
+            logger.error(
+                "CUSTOM_WEBHOOK_BODY_TEMPLATE 不是有效 JSON，已回退为默认 Webhook payload: %s",
+                exc,
+            )
+            return None
+        if not isinstance(payload, dict):
+            logger.error(
+                "CUSTOM_WEBHOOK_BODY_TEMPLATE 必须渲染为 JSON object，已回退为默认 Webhook payload"
+            )
+            return None
+        return payload
     
     def _send_dingtalk_chunked(self, url: str, content: str, max_bytes: int = 20000) -> bool:
         import time as _time
 
         # 为 payload 开销预留空间，避免 body 超限
         budget = max(1000, max_bytes - 1500)
-        chunks = chunk_markdown_by_bytes(content, budget)
+        chunks = chunk_content_by_max_bytes(content, budget)
         if not chunks:
             return False
 
@@ -222,7 +269,7 @@ class CustomWebhookSender:
             body_bytes = len(json.dumps(payload, ensure_ascii=False).encode('utf-8'))
             if body_bytes > max_bytes:
                 hard_budget = max(200, budget - (body_bytes - max_bytes) - 200)
-                payload["markdown"]["text"] = truncate_to_bytes(payload["markdown"]["text"], hard_budget)
+                payload["markdown"]["text"], _ = slice_at_max_bytes(payload["markdown"]["text"], hard_budget)
 
             if self._post_custom_webhook(url, payload, timeout=30):
                 ok += 1
